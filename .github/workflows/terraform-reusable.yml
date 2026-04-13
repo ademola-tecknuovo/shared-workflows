@@ -1,0 +1,153 @@
+name: Terraform Reusable Workflow
+
+on:
+  workflow_call:
+    inputs:
+      aws_region:
+        description: "AWS region to deploy to"
+        required: true
+        type: string
+      tf_version:
+        description: "Terraform version to use"
+        required: false
+        type: string
+        default: "1.10.0"
+      working_directory:
+        description: "Directory containing Terraform files"
+        required: false
+        type: string
+        default: "."
+      lambda_function_name:
+        description: "Name of the Lambda function"
+        required: false
+        type: string
+        default: ""
+      sns_topic_name:
+        description: "Name of the SNS topic"
+        required: false
+        type: string
+        default: ""
+      log_retention_days:
+        description: "CloudWatch log retention in days"
+        required: false
+        type: string
+        default: "14"
+    secrets:
+      aws_role_arn:
+        description: "ARN of the IAM role to assume via OIDC"
+        required: true
+      bucket_name:
+        description: "S3 bucket name"
+        required: false
+      notification_email:
+        description: "Email address for SNS notifications"
+        required: false
+
+concurrency:
+  group: terraform-deploy
+  cancel-in-progress: false
+
+jobs:
+
+  # ──────────────────────────────────────────────
+  # JOB 1: Plan
+  # ──────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Create terraform.tfvars
+        run: |
+          cat > terraform.tfvars <<EOF
+          aws_region           = "${{ inputs.aws_region }}"
+          bucket_name          = "${{ secrets.bucket_name }}"
+          lambda_function_name = "${{ inputs.lambda_function_name }}"
+          sns_topic_name       = "${{ inputs.sns_topic_name }}"
+          notification_email   = "${{ secrets.notification_email }}"
+          log_retention_days   = ${{ inputs.log_retention_days }}
+          EOF
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Format Check
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -no-color
+        continue-on-error: false
+
+  # ──────────────────────────────────────────────
+  # JOB 2: Apply (only on push or manual run to main)
+  # ──────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+
+    permissions:
+      id-token: write
+      contents: read
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws_role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Create terraform.tfvars
+        run: |
+          cat > terraform.tfvars <<EOF
+          aws_region           = "${{ inputs.aws_region }}"
+          bucket_name          = "${{ secrets.bucket_name }}"
+          lambda_function_name = "${{ inputs.lambda_function_name }}"
+          sns_topic_name       = "${{ inputs.sns_topic_name }}"
+          notification_email   = "${{ secrets.notification_email }}"
+          log_retention_days   = ${{ inputs.log_retention_days }}
+          EOF
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color
