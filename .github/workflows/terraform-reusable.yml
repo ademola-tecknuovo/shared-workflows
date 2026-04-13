@@ -1,48 +1,60 @@
 name: Terraform Reusable Workflow
 
+# workflow_call means this file cannot be triggered directly.
+# It can only be called (referenced) by a workflow in another repository.
+# This is what makes it "reusable" — it acts like a shared function.
 on:
   workflow_call:
+
+    # Inputs are non-sensitive configuration values passed in by the calling repo.
+    # Think of these like arguments you pass into a function.
     inputs:
       aws_region:
         description: "AWS region to deploy to"
-        required: true
+        required: true         # Every caller must provide this — there is no sensible default
         type: string
       tf_version:
         description: "Terraform version to use"
         required: false
         type: string
-        default: "1.10.0"
+        default: "1.10.0"      # If the caller doesn't specify a version, this one is used
       working_directory:
         description: "Directory containing Terraform files"
         required: false
         type: string
-        default: "."
+        default: "."           # "." means the root of the repo — most projects keep Terraform files here
       lambda_function_name:
         description: "Name of the Lambda function"
         required: false
         type: string
-        default: ""
+        default: ""            # Optional — not every project will have a Lambda function
       sns_topic_name:
         description: "Name of the SNS topic"
         required: false
         type: string
-        default: ""
+        default: ""            # Optional — not every project will have an SNS topic
       log_retention_days:
         description: "CloudWatch log retention in days"
         required: false
         type: string
-        default: "14"
+        default: "14"          # Logs older than this are automatically deleted by AWS
+
+    # Secrets are sensitive values passed in by the calling repo.
+    # Unlike inputs, secrets are masked in logs — GitHub will never print them in plain text.
     secrets:
       aws_role_arn:
         description: "ARN of the IAM role to assume via OIDC"
-        required: true
+        required: true         # Every caller must provide this — it is needed to authenticate with AWS
       bucket_name:
         description: "S3 bucket name"
-        required: false
+        required: false        # Optional — not every project will have an S3 bucket
       notification_email:
         description: "Email address for SNS notifications"
-        required: false
+        required: false        # Optional — not every project will send email notifications
 
+# Ensures only one deployment runs at a time.
+# If a second pipeline is triggered whilst one is already running,
+# it will wait rather than both running simultaneously and potentially conflicting.
 concurrency:
   group: terraform-deploy
   cancel-in-progress: false
@@ -50,35 +62,51 @@ concurrency:
 jobs:
 
   # ──────────────────────────────────────────────
-  # JOB 1: Plan
+  # JOB 1: Terraform Plan
+  # Runs on every trigger — pushes, pull requests, and manual runs.
+  # This job is read-only — it previews what Terraform would change without touching AWS.
   # ──────────────────────────────────────────────
   terraform-plan:
     name: Terraform Plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest     # Spins up a fresh Ubuntu virtual machine to run this job
 
+    # These permissions are required for OIDC authentication.
+    # id-token: write — allows the runner to request a short-lived token from AWS
+    # contents: read  — allows the runner to check out (download) the repo code
     permissions:
       id-token: write
       contents: read
 
+    # Sets the working directory for every "run" step in this job.
+    # If the caller passes in a working_directory, all commands run from that folder.
     defaults:
       run:
         working-directory: ${{ inputs.working_directory }}
 
     steps:
+      # Downloads the repository code onto the runner so Terraform can access it
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Installs the specified version of Terraform on the runner
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ inputs.tf_version }}
 
+      # Authenticates with AWS using OIDC.
+      # Rather than using long-lived access keys, GitHub requests a short-lived token
+      # from AWS that expires when the job finishes — typically around 15 minutes.
+      # The role-to-assume value determines what permissions the pipeline has in AWS.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.aws_role_arn }}
           aws-region: ${{ inputs.aws_region }}
 
+      # Creates the terraform.tfvars file on the runner using values passed in by the caller.
+      # This file is gitignored in the project repo, so it must be recreated here each run.
+      # It tells Terraform the specific names and settings for this project's resources.
       - name: Create terraform.tfvars
         run: |
           cat > terraform.tfvars <<EOF
@@ -90,26 +118,44 @@ jobs:
           log_retention_days   = ${{ inputs.log_retention_days }}
           EOF
 
+      # Downloads the AWS provider plugin that Terraform needs to communicate with AWS.
+      # Also connects to the S3 remote backend to retrieve the existing Terraform state file.
       - name: Terraform Init
         run: terraform init
 
+      # Checks that all Terraform files are correctly formatted.
+      # If any file has inconsistent spacing or indentation, this step fails
+      # and the pipeline stops — enforcing consistent code style across the team.
       - name: Terraform Format Check
         run: terraform fmt -check
 
+      # Checks that the Terraform configuration is syntactically valid.
+      # Catches errors like missing required arguments or incorrect resource types
+      # before anything is sent to AWS.
       - name: Terraform Validate
         run: terraform validate
 
+      # Compares the Terraform configuration against the current state of AWS
+      # and produces a list of changes — what will be created, updated, or destroyed.
+      # This is read-only — nothing in AWS is changed at this point.
+      # continue-on-error: false means the pipeline stops here if the plan fails.
       - name: Terraform Plan
         run: terraform plan -no-color
         continue-on-error: false
 
   # ──────────────────────────────────────────────
-  # JOB 2: Apply (only on push or manual run to main)
+  # JOB 2: Terraform Apply
+  # Only runs when code is pushed or manually triggered on the main branch.
+  # This job makes actual changes to AWS — it deploys the infrastructure.
   # ──────────────────────────────────────────────
   terraform-apply:
     name: Terraform Apply
     runs-on: ubuntu-latest
-    needs: terraform-plan
+    needs: terraform-plan      # This job will not start until Job 1 (Plan) has passed successfully
+
+    # This condition checks two things before allowing Apply to run:
+    # 1. The branch must be main — Apply never runs on feature branches or PRs
+    # 2. The trigger must be a push or a manual run — not a pull request
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
 
     permissions:
@@ -121,6 +167,8 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
 
     steps:
+      # Each job runs on a brand new runner, so all steps must be repeated from scratch.
+      # The runner from Job 1 is discarded once Plan finishes — nothing carries over.
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -149,5 +197,9 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
+      # Applies the changes from the plan to AWS.
+      # -auto-approve skips the manual "yes" confirmation prompt —
+      # this is safe here because a human already reviewed the plan in Job 1.
+      # -no-color removes colour codes from the output so logs are easier to read in GitHub.
       - name: Terraform Apply
         run: terraform apply -auto-approve -no-color
